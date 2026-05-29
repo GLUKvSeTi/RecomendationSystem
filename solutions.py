@@ -317,3 +317,6 @@ final_df.plot(kind='bar', figsize=(12,5))
 plt.title('Сравнение моделей: BookCrossing')
 plt.ylabel('Score'); plt.xticks(rotation=15)
 plt.grid(axis='y', alpha=0.3); plt.tight_layout(); plt.show()
+
+if not hasattr(np.ndarray, 'ptp'):
+    np.ndarray.ptp = lambda self, *a, **kw: np.ptp(self, *a, **kw)
