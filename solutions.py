@@ -114,12 +114,18 @@ class LinUCB:
 print("\n=== Подготовка train/eval split для бандита ===")
 
 # Делим test пополам по юзерам
-all_test_users = test['User-ID'].drop_duplicates().values
-np.random.seed(42)
-np.random.shuffle(all_test_users)
+all_test_users = test['User-ID'].dropna().drop_duplicates().to_numpy()
+all_test_users = np.array(all_test_users, dtype=object)  # фикс для shuffle
+rng = np.random.default_rng(42)
+rng.shuffle(all_test_users)
+
 half = len(all_test_users) // 2
-sim_users = all_test_users[:half]      # для обучения бандита
-eval_users = all_test_users[half:]     # для финальной оценки
+sim_users  = all_test_users[:half].tolist()
+eval_users = all_test_users[half:].tolist()
+
+print(f"Всего test юзеров: {len(all_test_users)}")
+print(f"sim_users:  {len(sim_users)}")
+print(f"eval_users: {len(eval_users)}")  # для финальной оценки
 
 print(f"sim_users:  {len(sim_users)}")
 print(f"eval_users: {len(eval_users)}")
