@@ -1,5 +1,6 @@
 # ============================================================
-# ОБОГАЩЕНИЕ: Open Library + Google Books (комбо)
+# ОБОГАЩЕНИЕ ДАННЫХ (исправленная версия)
+# Open Library + Google Books → чистые subjects → TF-IDF
 # ============================================================
 import requests, json, os, urllib3
 import numpy as np
@@ -12,7 +13,9 @@ from tqdm import tqdm
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# === 0. Подготовка ===
+# ============================================================
+# 0. ПОДГОТОВКА
+# ============================================================
 books = books.reset_index(drop=True)
 books['Title']     = books['Title'].fillna('').astype(str)
 books['Author']    = books['Author'].fillna('').astype(str)
@@ -28,7 +31,9 @@ tfidf_base = TfidfVectorizer(stop_words='english', max_features=10000,
 tfidf_matrix_base = tfidf_base.fit_transform(books['content'])
 print(f"Базовый TF-IDF: {tfidf_matrix_base.shape}")
 
-# === 1. Кеш ===
+# ============================================================
+# 1. КЕШ (используем существующий)
+# ============================================================
 CACHE_FILE = 'book_meta_cache.json'
 if os.path.exists(CACHE_FILE):
     with open(CACHE_FILE) as f:
@@ -37,19 +42,18 @@ if os.path.exists(CACHE_FILE):
 else:
     cache = {}
 
-# === 2. Open Library: пробуем два endpoint-а ===
+# ============================================================
+# 2. ФУНКЦИИ ЗАПРОСА (на случай если кеш не полный)
+# ============================================================
 def fetch_openlibrary(isbn):
-    """Пробует сначала /isbn/.json, потом /api/books"""
     try:
-        # endpoint 1: прямой
         r = requests.get(f"https://openlibrary.org/isbn/{isbn}.json",
                          timeout=5, verify=False, allow_redirects=True)
         if r.status_code == 200:
             data = r.json()
             subjects = data.get('subjects', [])
             if subjects:
-                return ' '.join(subjects)
-            # Если subjects пустой — пробуем подтянуть work
+                return ' '.join(subjects[:10])
             works = data.get('works', [])
             if works:
                 work_key = works[0].get('key')
@@ -57,15 +61,13 @@ def fetch_openlibrary(isbn):
                     rw = requests.get(f"https://openlibrary.org{work_key}.json",
                                       timeout=5, verify=False)
                     if rw.status_code == 200:
-                        wdata = rw.json()
-                        subjects = wdata.get('subjects', [])
+                        subjects = rw.json().get('subjects', [])
                         if subjects:
-                            return ' '.join(subjects[:20])  # ограничим
+                            return ' '.join(subjects[:10])
     except Exception:
         pass
     return ''
 
-# === 3. Google Books: запасной источник ===
 def fetch_google(isbn):
     try:
         url = f"https://www.googleapis.com/books/v1/volumes?q=isbn:{isbn}"
@@ -74,33 +76,29 @@ def fetch_google(isbn):
         if data.get('totalItems', 0) > 0:
             info = data['items'][0]['volumeInfo']
             cats = info.get('categories', [])
-            desc = info.get('description', '')
-            return ' '.join(cats) + ' ' + desc[:500]  # часть описания
+            return ' '.join(cats)   # ТОЛЬКО категории, БЕЗ описания
     except Exception:
         pass
     return ''
 
-# === 4. Совмещаем источники ===
 def fetch_book(isbn):
-    # Сначала Open Library
     text = fetch_openlibrary(isbn)
-    # Если пусто — пробуем Google
     if not text.strip():
         text = fetch_google(isbn)
     return isbn, text.strip()
 
-# === 5. Скачиваем ===
+# ============================================================
+# 3. ДОКАЧИВАЕМ НЕДОСТАЮЩЕЕ
+# ============================================================
 to_fetch = [isbn for isbn in books['ISBN'].values if isbn not in cache]
 print(f"Нужно скачать: {len(to_fetch)}")
 
 if to_fetch:
-    # Уменьшаем число потоков чтобы не словить rate-limit Google
     with ThreadPoolExecutor(max_workers=10) as ex:
         futures = {ex.submit(fetch_book, isbn): isbn for isbn in to_fetch}
         for i, f in enumerate(tqdm(as_completed(futures), total=len(futures))):
             isbn, text = f.result()
             cache[isbn] = text
-            # Сохраняем кеш каждые 500 запросов на случай падения
             if (i+1) % 500 == 0:
                 with open(CACHE_FILE, 'w') as fp:
                     json.dump(cache, fp)
@@ -108,31 +106,50 @@ if to_fetch:
         json.dump(cache, f)
     print(f"Сохранено в кеш: {len(cache)}")
 
-# === 6. Добавляем в books ===
-books['subjects'] = books['ISBN'].map(lambda x: cache.get(x, ''))
+# ============================================================
+# 4. ОЧИСТКА: берём только первые ~10 слов (чистые категории, без воды)
+# ============================================================
+def clean_subjects(s):
+    if not s:
+        return ''
+    tokens = s.split()
+    return ' '.join(tokens[:10])
+
+books['subjects'] = books['ISBN'].map(lambda x: clean_subjects(cache.get(x, '')))
 enriched = (books['subjects'].str.len() > 0).sum()
 print(f"Обогащено: {enriched} из {len(books)} ({100*enriched/len(books):.1f}%)")
 
-# Примеры
 print("\nПримеры обогащённых данных:")
-ex = books[books['subjects'].str.len() > 10][['Title','subjects']].head(3)
+ex = books[books['subjects'].str.len() > 5][['Title','subjects']].head(3)
 for _, row in ex.iterrows():
-    print(f"  «{row['Title'][:40]}» → {row['subjects'][:120]}")
+    print(f"  «{row['Title'][:40]}» → {row['subjects'][:100]}")
 
-# === 7. Обогащённый TF-IDF ===
+# ============================================================
+# 5. ОБОГАЩЁННЫЙ КОНТЕНТ С ПРАВИЛЬНЫМИ ВЕСАМИ
+# Автор и Title — главные сигналы, subjects — дополнительный
+# ============================================================
 books['content_enriched'] = (
-    books['Title'] + ' ' +
-    books['Author'] + ' ' +
+    (books['Title']  + ' ') * 2 +     # x2 заголовок
+    (books['Author'] + ' ') * 3 +     # x3 автор (главный сигнал!)
     books['Publisher'] + ' ' +
-    books['subjects'] + ' ' + books['subjects']
+    books['subjects']                 # x1 темы (только дополняют)
 )
 
-tfidf_enriched = TfidfVectorizer(stop_words='english', max_features=20000,
-                                  ngram_range=(1,2), min_df=2)
+# Строгий TF-IDF: режем общие и редкие слова
+tfidf_enriched = TfidfVectorizer(
+    stop_words='english',
+    max_features=15000,
+    ngram_range=(1,2),
+    min_df=3,             # минимум в 3 документах
+    max_df=0.5,           # максимум в 50% документов
+    sublinear_tf=True     # log-масштабирование
+)
 tfidf_matrix_enriched = tfidf_enriched.fit_transform(books['content_enriched'])
 print(f"\nОбогащённый TF-IDF: {tfidf_matrix_enriched.shape}")
 
-# === 8. Фабрика рекомендера ===
+# ============================================================
+# 6. ФАБРИКА РЕКОМЕНДЕРА
+# ============================================================
 def make_content_rec(matrix):
     def rec(uid, top_n=10):
         ur = train[train['User-ID']==uid]
@@ -151,20 +168,27 @@ def make_content_rec(matrix):
         return [c[0] for c in cands[:top_n]]
     return rec
 
-# === 9. Сравнение ===
+# ============================================================
+# 7. СРАВНЕНИЕ
+# ============================================================
 print("\n" + "="*60)
-print("СРАВНЕНИЕ")
+print("СРАВНЕНИЕ CONTENT-MODEL")
 print("="*60)
+
 content_results = [
     evaluate(make_content_rec(tfidf_matrix_base),     test, name="Content base"),
-    evaluate(make_content_rec(tfidf_matrix_enriched), test, name="Content + OL/Google"),
+    evaluate(make_content_rec(tfidf_matrix_enriched), test, name="Content + enriched"),
 ]
 print(pd.DataFrame(content_results).to_string(index=False))
 
-# === 10. Глобальные переменные ===
-tfidf_matrix = tfidf_matrix_enriched
+# ============================================================
+# 8. ОБНОВЛЯЕМ ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
+# ============================================================
+tfidf_matrix      = tfidf_matrix_enriched
 recommend_content = make_content_rec(tfidf_matrix)
 
 if 'sample_user' in dir():
     print(f"\nОбогащённый Content рекомендует для юзера {sample_user}:")
     print(show_books(recommend_content(sample_user)))
+
+print("\n✓ Готово. tfidf_matrix обновлён.")
