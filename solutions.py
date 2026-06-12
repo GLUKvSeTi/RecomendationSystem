@@ -1,338 +1,415 @@
 # ============================================================
-# CONTEXTUAL BANDIT над моделями (исправленная версия)
-# Fix 1: правильная offline evaluation (награда из test, обучение на train→test split)
-# Fix 2: NDCG-aware reward (а не просто precision)
-# Fix 3: расширенный контекст
+# OFFLINE EVALUATION FRAMEWORK
+# Универсальная система для оценки и сравнения РС
+# Можно подключить свою РС или РС компаньона
 # ============================================================
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 from collections import defaultdict
 from tqdm import tqdm
+import json
+import time
 
-print("="*60)
-print("CONTEXTUAL BANDIT (исправленная версия)")
-print("="*60)
-
-# ============================================================
-# 1. ARMS
-# ============================================================
-arms = {
-    'Content':  recommend_content,
-    'SVD':      recommend_svd,
-    'Cascade':  recommend_hybrid,
-}
-arm_names = list(arms.keys())
-n_arms = len(arms)
+print("="*70)
+print("OFFLINE EVALUATION FRAMEWORK FOR RECOMMENDER SYSTEMS")
+print("="*70)
 
 # ============================================================
-# 2. РАСШИРЕННЫЙ КОНТЕКСТ
+# 1. СТАНДАРТ ОБМЕНА: ИНТЕРФЕЙС РЕКОМЕНДЕРА
 # ============================================================
-user_stats = train.groupby('User-ID').agg(
-    n_ratings=('Rating', 'count'),
-    avg_rating=('Rating', 'mean'),
-    std_rating=('Rating', 'std'),
-    n_high=('Rating', lambda x: (x >= 7).sum()),
-    n_low=('Rating', lambda x: (x <= 4).sum()),
-).fillna(0)
+"""
+СПЕЦИФИКАЦИЯ ИНТЕРФЕЙСА
 
-book_pop_arr = book_pop
-def avg_pop(uid):
-    isbns = train[train['User-ID']==uid]['ISBN']
-    pops = [book_pop_arr[book2idx[i]] for i in isbns if i in book2idx]
-    return np.mean(pops) if pops else 0
-
-def n_unique_authors(uid):
-    return train[train['User-ID']==uid].merge(
-        books[['ISBN','Author']], on='ISBN')['Author'].nunique()
-
-user_stats['avg_pop']   = [avg_pop(u) for u in user_stats.index]
-user_stats['n_authors'] = [n_unique_authors(u) for u in user_stats.index]
-user_stats['diversity'] = user_stats['n_authors'] / np.maximum(user_stats['n_ratings'], 1)
-
-def normalize_col(c):
-    return (c - c.min()) / (c.max() - c.min() + 1e-9)
-
-for col in ['n_ratings','avg_rating','std_rating','n_high','n_low',
-            'avg_pop','n_authors','diversity']:
-    user_stats[f'f_{col}'] = normalize_col(
-        np.log1p(user_stats[col]) if col in ['n_ratings','n_high','n_low','avg_pop','n_authors']
-        else user_stats[col]
-    )
-
-def get_context(uid):
-    if uid in user_stats.index:
-        row = user_stats.loc[uid]
-        return np.array([
-            1.0,
-            row['f_n_ratings'],
-            row['f_avg_rating'],
-            row['f_std_rating'],
-            row['f_n_high'],
-            row['f_n_low'],
-            row['f_avg_pop'],
-            row['f_diversity'],
-        ])
-    return np.array([1.0] + [0.5]*7)
-
-d = 8
-print(f"✓ Контекст: d={d}")
-
-# ============================================================
-# 3. LinUCB
-# ============================================================
-class LinUCB:
-    def __init__(self, n_arms, d, alpha=1.0):
-        self.n_arms, self.d, self.alpha = n_arms, d, alpha
-        self.A = [np.eye(d) for _ in range(n_arms)]
-        self.b = [np.zeros(d) for _ in range(n_arms)]
-        self.A_inv = [np.eye(d) for _ in range(n_arms)]
+Любая РС должна реализовывать функцию:
     
-    def _theta(self, a):
-        return self.A_inv[a] @ self.b[a]
-    
-    def predict_ucb(self, x):
-        scores = np.zeros(self.n_arms)
-        for a in range(self.n_arms):
-            theta = self._theta(a)
-            scores[a] = x @ theta + self.alpha * np.sqrt(max(x @ self.A_inv[a] @ x, 0))
-        return scores
-    
-    def predict_mean(self, x):
-        return np.array([x @ self._theta(a) for a in range(self.n_arms)])
-    
-    def update(self, a, x, r):
-        self.A[a] += np.outer(x, x)
-        self.b[a] += r * x
-        self.A_inv[a] = np.linalg.inv(self.A[a])
+    def recommend(user_id, top_n=10) -> list[str]
+        '''
+        Возвращает упорядоченный список ISBN-ов из top_n рекомендаций
+        для пользователя user_id.
+        
+        Args:
+            user_id: ID пользователя (int или str)
+            top_n: количество рекомендаций
+            
+        Returns:
+            Список ISBN. Если рекомендации невозможны — пустой список.
+            ISBN из user history (train) исключаются.
+        '''
+
+ОБЩИЕ ДАННЫЕ (одинаковые для всех РС):
+    train: pd.DataFrame с колонками [User-ID, ISBN, Rating]
+    test:  pd.DataFrame с колонками [User-ID, ISBN, Rating]
+    books: pd.DataFrame с колонками [ISBN, Title, Author, Publisher, ...]
+
+КРИТЕРИЙ РЕЛЕВАНТНОСТИ: Rating >= 7 в test
+"""
 
 # ============================================================
-# 4. ОБУЧЕНИЕ: ПРАВИЛЬНОЕ — против test, через CROSS-VAL
+# 2. БАЗОВЫЕ МЕТРИКИ (точность)
 # ============================================================
-# Ключевая идея: используем test как "ground truth" для обучения бандита,
-# НО только на половине test (sim half), а оцениваем на другой половине
 
-print("\n=== Подготовка train/eval split для бандита ===")
+def precision_at_k(recs, relevant, k):
+    if not recs: return 0.0
+    return sum(1 for isbn in recs[:k] if isbn in relevant) / k
 
-# Делим test пополам по юзерам
-all_test_users = test['User-ID'].dropna().drop_duplicates().to_numpy()
-all_test_users = np.array(all_test_users, dtype=object)  # фикс для shuffle
-rng = np.random.default_rng(42)
-rng.shuffle(all_test_users)
+def recall_at_k(recs, relevant, k):
+    if not relevant or not recs: return 0.0
+    return sum(1 for isbn in recs[:k] if isbn in relevant) / len(relevant)
 
-half = len(all_test_users) // 2
-sim_users  = all_test_users[:half].tolist()
-eval_users = all_test_users[half:].tolist()
+def hit_at_k(recs, relevant, k):
+    return 1.0 if any(isbn in relevant for isbn in recs[:k]) else 0.0
 
-print(f"Всего test юзеров: {len(all_test_users)}")
-print(f"sim_users:  {len(sim_users)}")
-print(f"eval_users: {len(eval_users)}")  # для финальной оценки
-
-print(f"sim_users:  {len(sim_users)}")
-print(f"eval_users: {len(eval_users)}")
-
-# user_liked из ВСЕГО test (это правильно — это и есть наши labels)
-user_liked = defaultdict(set)
-for _, r in test[test['Rating'] >= 7].iterrows():
-    user_liked[r['User-ID']].add(r['ISBN'])
-
-# ============================================================
-# 5. НАГРАДА = NDCG@10 (а не precision!)
-# ============================================================
-def compute_ndcg(recs, relevant_set, k=10):
-    if not relevant_set or not recs:
-        return 0.0
-    dcg = 0.0
+def average_precision(recs, relevant, k):
+    if not relevant or not recs: return 0.0
+    ap, hits = 0.0, 0
     for i, isbn in enumerate(recs[:k]):
-        if isbn in relevant_set:
-            dcg += 1.0 / np.log2(i + 2)
-    idcg = sum(1.0 / np.log2(i + 2) for i in range(min(len(relevant_set), k)))
+        if isbn in relevant:
+            hits += 1
+            ap += hits / (i + 1)
+    return ap / min(len(relevant), k)
+
+def ndcg_at_k(recs, relevant, k):
+    if not relevant or not recs: return 0.0
+    dcg = sum(1.0/np.log2(i+2) for i, isbn in enumerate(recs[:k]) if isbn in relevant)
+    idcg = sum(1.0/np.log2(i+2) for i in range(min(len(relevant), k)))
     return dcg / idcg if idcg > 0 else 0.0
 
 # ============================================================
-# 6. ОБУЧЕНИЕ БАНДИТА
+# 3. МЕТРИКИ ВНЕ ТОЧНОСТИ (важны для качества РС)
 # ============================================================
-print("\n=== Обучение LinUCB ===")
-bandit = LinUCB(n_arms=n_arms, d=d, alpha=2.0)
 
-# Кеш рекомендаций (чтобы не пересчитывать)
-rec_cache = {}
+def coverage(all_recs, n_books_total):
+    """Catalog Coverage: какую долю каталога РС вообще рекомендует"""
+    unique_recommended = set()
+    for recs in all_recs:
+        unique_recommended.update(recs)
+    return len(unique_recommended) / n_books_total
 
-arm_pulls = np.zeros(n_arms)
-arm_rewards = np.zeros(n_arms)
-
-for uid in tqdm(sim_users, desc="Training"):
-    relevant = user_liked.get(uid, set())
-    if not relevant:
-        continue
+def diversity_intra_list(recs, item_features, mat):
+    """Intra-list diversity: средняя НЕпохожесть рекомендаций между собой"""
+    if len(recs) < 2: return 0.0
+    indices = [item_features[isbn] for isbn in recs if isbn in item_features]
+    if len(indices) < 2: return 0.0
     
-    x = get_context(uid)
+    from sklearn.metrics.pairwise import cosine_similarity
+    vecs = mat[indices]
+    sims = cosine_similarity(vecs)
+    # Берём верхний треугольник без диагонали
+    n = sims.shape[0]
+    mean_sim = (sims.sum() - n) / (n * (n - 1))
+    return 1.0 - mean_sim  # diversity = 1 - similarity
+
+def novelty(recs, popularity_dict):
+    """Novelty: -log(p(item)) — насколько редкие книги рекомендуем"""
+    if not recs: return 0.0
+    total = sum(popularity_dict.values())
+    novelties = []
+    for isbn in recs:
+        p = popularity_dict.get(isbn, 1) / total
+        novelties.append(-np.log2(p))
+    return np.mean(novelties)
+
+def serendipity(recs, relevant, popularity_dict):
+    """
+    Serendipity: релевантные И при этом непопулярные рекомендации
+    (РС угадала не банальные, а оригинальные предпочтения)
+    """
+    if not recs: return 0.0
+    pop_values = list(popularity_dict.values())
+    median_pop = np.median(pop_values) if pop_values else 0
     
-    # Обновляем ВСЕ руки (batch update — корректно для offline)
-    for a, name in enumerate(arm_names):
-        key = (uid, name)
-        if key not in rec_cache:
-            try:
-                rec_cache[key] = arms[name](uid, top_n=10)
-            except Exception:
-                rec_cache[key] = []
-        recs = rec_cache[key]
-        
-        # Награда = NDCG@10
-        reward = compute_ndcg(recs, relevant, k=10)
-        
-        bandit.update(a, x, reward)
-        arm_pulls[a] += 1
-        arm_rewards[a] += reward
-
-print("\n=== Статистика обучения ===")
-for a, name in enumerate(arm_names):
-    avg = arm_rewards[a] / max(arm_pulls[a], 1)
-    print(f"  {name:10s}: avg NDCG = {avg:.4f}  ({int(arm_pulls[a])} pulls)")
+    score = 0
+    for isbn in recs:
+        if isbn in relevant and popularity_dict.get(isbn, 0) < median_pop:
+            score += 1
+    return score / len(recs)
 
 # ============================================================
-# 7. РЕКОМЕНДАТЕЛЬ С БАНДИТОМ
+# 4. ГЛАВНАЯ ФУНКЦИЯ ОЦЕНИВАНИЯ
 # ============================================================
-def recommend_bandit_over_models(uid, top_n=10):
-    x = get_context(uid)
-    scores = bandit.predict_mean(x)  # без UCB bonus на inference
-    a = int(np.argmax(scores))
-    return arms[arm_names[a]](uid, top_n=top_n)
 
-# ============================================================
-# 8. АНАЛИЗ ВЫБОРА РУК (на eval_users)
-# ============================================================
-print("\n=== Распределение выбора рук на eval_users ===")
-choices = defaultdict(int)
-choice_per_user = {}
-for uid in eval_users:
-    x = get_context(uid)
-    scores = bandit.predict_mean(x)
-    a = int(np.argmax(scores))
-    choices[arm_names[a]] += 1
-    choice_per_user[uid] = arm_names[a]
+# Готовим вспомогательные структуры
+book_pop_dict = dict(zip(
+    [idx2book[i] for i in range(n_books)],
+    book_pop.tolist()
+))
 
-total = sum(choices.values())
-for name in arm_names:
-    cnt = choices.get(name, 0)
-    print(f"  {name:10s}: {cnt:4d}  ({100*cnt/max(total,1):5.1f}%)")
+# Test relevance
+test_relevant = defaultdict(set)
+for _, r in test[test['Rating'] >= 7].iterrows():
+    test_relevant[r['User-ID']].add(r['ISBN'])
 
-# Если опять все Content — диагностика
-if choices.get('Content', 0) / max(total, 1) > 0.9:
-    print("\n⚠ Bandit опять предпочитает Content. Усиливаем exploration:")
-    print("  Прогоняем второй раунд обучения с alpha=5.0...")
-    bandit.alpha = 5.0
-    # перевзвешиваем награды: вычитаем среднюю награду Content из всех
-    # это делает Content менее доминирующим
-    content_mean = arm_rewards[0] / max(arm_pulls[0], 1)
-    bandit2 = LinUCB(n_arms=n_arms, d=d, alpha=2.0)
-    for uid in tqdm(sim_users, desc="Re-training"):
-        relevant = user_liked.get(uid, set())
-        if not relevant:
-            continue
-        x = get_context(uid)
-        for a, name in enumerate(arm_names):
-            recs = rec_cache.get((uid, name), [])
-            reward = compute_ndcg(recs, relevant, k=10)
-            # Центрируем награду
-            reward_centered = reward - content_mean
-            bandit2.update(a, x, reward_centered)
-    bandit = bandit2
+# Категории юзеров по размеру истории
+user_history_size = train.groupby('User-ID').size()
+cold_users   = set(user_history_size[user_history_size < 5].index)
+warm_users   = set(user_history_size[(user_history_size >= 5) & (user_history_size < 20)].index)
+heavy_users  = set(user_history_size[user_history_size >= 20].index)
+
+
+def evaluate_full(recommend_fn, name="Model", k=10, 
+                  max_users=500, verbose=True):
+    """
+    Полная оценка РС со всеми метриками
+    """
+    # Юзеры из test с релевантными книгами
+    eligible_users = [u for u in test_relevant if len(test_relevant[u]) > 0]
     
-    # Перепроверяем
-    print("\nПосле перебалансировки:")
-    choices = defaultdict(int)
-    for uid in eval_users:
-        x = get_context(uid)
-        scores = bandit.predict_mean(x)
-        a = int(np.argmax(scores))
-        choices[arm_names[a]] += 1
-    for name in arm_names:
-        cnt = choices.get(name, 0)
-        print(f"  {name:10s}: {cnt:4d}  ({100*cnt/max(total,1):5.1f}%)")
-
-# ============================================================
-# 9. ФИНАЛЬНАЯ ОЦЕНКА (только на eval_users!)
-# ============================================================
-print("\n" + "="*60)
-print("ФИНАЛЬНАЯ ОЦЕНКА (на eval_users — не участвовали в обучении)")
-print("="*60)
-
-# Кастомная оценка только по eval_users
-def evaluate_on_users(recommend_fn, users, k=10, name=""):
+    np.random.seed(42)
+    if len(eligible_users) > max_users:
+        eligible_users = np.random.choice(eligible_users, max_users, replace=False).tolist()
+    
+    # Метрики
     P, R, H, AP, NDCG = [], [], [], [], []
-    for uid in users:
-        relevant = user_liked.get(uid, set())
-        if not relevant:
+    NOV, SER = [], []
+    
+    # Метрики по сегментам юзеров
+    metrics_by_segment = defaultdict(lambda: {'NDCG': [], 'HR': []})
+    
+    all_recs = []
+    inference_times = []
+    failed = 0
+    
+    iterator = tqdm(eligible_users, desc=f"Evaluating {name}") if verbose else eligible_users
+    
+    for uid in iterator:
+        relevant = test_relevant[uid]
+        
+        t0 = time.time()
+        try:
+            recs = recommend_fn(uid, top_n=k)
+        except Exception as e:
+            failed += 1
             continue
-        recs = recommend_fn(uid, top_n=k)
+        inference_times.append(time.time() - t0)
+        
         if not recs:
+            failed += 1
             continue
-        hits = [1 if isbn in relevant else 0 for isbn in recs]
-        n_hits = sum(hits)
-        P.append(n_hits / k)
-        R.append(n_hits / len(relevant))
-        H.append(1.0 if n_hits > 0 else 0.0)
-        # AP
-        ap = 0.0; cum = 0
-        for i, h in enumerate(hits):
-            if h:
-                cum += 1
-                ap += cum / (i + 1)
-        AP.append(ap / min(len(relevant), k))
-        # NDCG
-        NDCG.append(compute_ndcg(recs, relevant, k))
-    return {
+        
+        all_recs.append(recs)
+        
+        # Точность
+        P.append(precision_at_k(recs, relevant, k))
+        R.append(recall_at_k(recs, relevant, k))
+        H.append(hit_at_k(recs, relevant, k))
+        AP.append(average_precision(recs, relevant, k))
+        NDCG.append(ndcg_at_k(recs, relevant, k))
+        
+        # Качество
+        NOV.append(novelty(recs, book_pop_dict))
+        SER.append(serendipity(recs, relevant, book_pop_dict))
+        
+        # По сегментам
+        ndcg_val = NDCG[-1]
+        hr_val   = H[-1]
+        if uid in cold_users:
+            metrics_by_segment['cold']['NDCG'].append(ndcg_val)
+            metrics_by_segment['cold']['HR'].append(hr_val)
+        elif uid in warm_users:
+            metrics_by_segment['warm']['NDCG'].append(ndcg_val)
+            metrics_by_segment['warm']['HR'].append(hr_val)
+        elif uid in heavy_users:
+            metrics_by_segment['heavy']['NDCG'].append(ndcg_val)
+            metrics_by_segment['heavy']['HR'].append(hr_val)
+    
+    # Coverage (по всем рекомендациям)
+    cov = coverage(all_recs, n_books)
+    
+    # Diversity (на подвыборке)
+    div_scores = []
+    for recs in all_recs[:100]:
+        div_scores.append(diversity_intra_list(recs, isbn2tfidf, tfidf_matrix))
+    
+    result = {
         'Model': name,
-        f'Precision@{k}': round(np.mean(P), 4),
-        f'Recall@{k}':    round(np.mean(R), 4),
-        f'HitRate@{k}':   round(np.mean(H), 4),
-        f'MAP@{k}':       round(np.mean(AP), 4),
-        f'NDCG@{k}':      round(np.mean(NDCG), 4),
+        # ==== ТОЧНОСТЬ ====
+        f'Precision@{k}':  round(np.mean(P), 4),
+        f'Recall@{k}':     round(np.mean(R), 4),
+        f'HitRate@{k}':    round(np.mean(H), 4),
+        f'MAP@{k}':        round(np.mean(AP), 4),
+        f'NDCG@{k}':       round(np.mean(NDCG), 4),
+        # ==== КАЧЕСТВО ====
+        'Coverage':        round(cov, 4),
+        'Diversity':       round(np.mean(div_scores), 4) if div_scores else 0,
+        'Novelty':         round(np.mean(NOV), 2),
+        'Serendipity':     round(np.mean(SER), 4),
+        # ==== СЕГМЕНТЫ ====
+        'NDCG@cold':       round(np.mean(metrics_by_segment['cold']['NDCG']), 4) if metrics_by_segment['cold']['NDCG'] else 0,
+        'NDCG@warm':       round(np.mean(metrics_by_segment['warm']['NDCG']), 4) if metrics_by_segment['warm']['NDCG'] else 0,
+        'NDCG@heavy':      round(np.mean(metrics_by_segment['heavy']['NDCG']), 4) if metrics_by_segment['heavy']['NDCG'] else 0,
+        # ==== ПРОИЗВОДИТЕЛЬНОСТЬ ====
+        'Avg_time_ms':     round(np.mean(inference_times) * 1000, 1) if inference_times else 0,
+        'Failed':          failed,
+        'N_evaluated':     len(P),
     }
-
-results = []
-results.append(evaluate_on_users(recommend_content, eval_users, name="Content only"))
-results.append(evaluate_on_users(recommend_svd,     eval_users, name="SVD only"))
-results.append(evaluate_on_users(recommend_hybrid,  eval_users, name="Cascade Hybrid"))
-results.append(evaluate_on_users(recommend_bandit_over_models, eval_users,
-                                 name="Bandit over models"))
-
-res_df = pd.DataFrame(results).set_index('Model')
-print(res_df)
-
-# Сравнение
-bandit_ndcg  = res_df.loc['Bandit over models', 'NDCG@10']
-best_single = res_df.drop('Bandit over models')['NDCG@10'].max()
-best_name = res_df.drop('Bandit over models')['NDCG@10'].idxmax()
-
-print(f"\nBandit NDCG@10:  {bandit_ndcg:.4f}")
-print(f"Best single ({best_name}): {best_single:.4f}")
-if bandit_ndcg > best_single:
-    print(f"✅ Bandit лучше! +{100*(bandit_ndcg/best_single-1):+.1f}%")
-elif bandit_ndcg >= best_single * 0.98:
-    print(f"≈ Bandit практически как лучшая модель (разница < 2%)")
-else:
-    print(f"⚠ Bandit хуже лучшей на {100*(best_single/bandit_ndcg-1):+.1f}%")
+    return result
 
 # ============================================================
-# 10. БОНУС: ORACLE — теоретический потолок выбора руки
+# 5. РЕЕСТР МОДЕЛЕЙ (можно добавить РС компаньона)
 # ============================================================
-print("\n=== Oracle: что было бы если выбирать ЛУЧШУЮ руку для каждого юзера ===")
-oracle_ndcg = []
-for uid in eval_users:
-    relevant = user_liked.get(uid, set())
-    if not relevant:
-        continue
-    best_ndcg = 0
-    for name in arm_names:
-        recs = arms[name](uid, top_n=10)
-        ndcg = compute_ndcg(recs, relevant, k=10)
-        if ndcg > best_ndcg:
-            best_ndcg = ndcg
-    oracle_ndcg.append(best_ndcg)
 
-print(f"Oracle NDCG@10: {np.mean(oracle_ndcg):.4f}")
-print(f"(теоретический максимум, если бы bandit всегда выбирал лучшую руку для юзера)")
+# Свои модели
+my_models = {
+    'Content':         recommend_content,
+    'SVD':             recommend_svd,
+    'Cascade Hybrid':  recommend_hybrid,
+    'Bandit Ensemble': recommend_bandit,
+}
 
-recommend_bandit = recommend_bandit_over_models
-print("\n✓ Готово")
+# === МЕСТО ДЛЯ РС КОМПАНЬОНА ===
+# Закомментируйте/раскомментируйте при обмене:
+#
+# def recommend_companion(user_id, top_n=10):
+#     # код РС компаньона
+#     return [...]
+# 
+# my_models['Companion RS'] = recommend_companion
+
+# ============================================================
+# 6. ЗАПУСК ОЦЕНИВАНИЯ
+# ============================================================
+print("\n" + "="*70)
+print("ОЦЕНИВАНИЕ МОДЕЛЕЙ")
+print("="*70)
+
+all_results = []
+for name, fn in my_models.items():
+    print(f"\n→ {name}")
+    res = evaluate_full(fn, name=name, k=10, max_users=500, verbose=False)
+    all_results.append(res)
+    print(f"  NDCG@10 = {res['NDCG@10']}, Coverage = {res['Coverage']}, "
+          f"Diversity = {res['Diversity']}")
+
+results_df = pd.DataFrame(all_results).set_index('Model')
+
+# ============================================================
+# 7. РЕЗУЛЬТАТЫ В НЕСКОЛЬКИХ ТАБЛИЦАХ
+# ============================================================
+print("\n" + "="*70)
+print("ТАБЛИЦА 1: МЕТРИКИ ТОЧНОСТИ")
+print("="*70)
+accuracy_cols = ['Precision@10', 'Recall@10', 'HitRate@10', 'MAP@10', 'NDCG@10']
+print(results_df[accuracy_cols].to_string())
+
+print("\n" + "="*70)
+print("ТАБЛИЦА 2: МЕТРИКИ КАЧЕСТВА (вне точности)")
+print("="*70)
+quality_cols = ['Coverage', 'Diversity', 'Novelty', 'Serendipity']
+print(results_df[quality_cols].to_string())
+
+print("\n" + "="*70)
+print("ТАБЛИЦА 3: ПРОИЗВОДИТЕЛЬНОСТЬ НА СЕГМЕНТАХ ЮЗЕРОВ")
+print("="*70)
+segment_cols = ['NDCG@cold', 'NDCG@warm', 'NDCG@heavy']
+print(results_df[segment_cols].to_string())
+print(f"\nРазмеры сегментов: cold={len(cold_users)}, warm={len(warm_users)}, heavy={len(heavy_users)}")
+
+print("\n" + "="*70)
+print("ТАБЛИЦА 4: ПРОИЗВОДИТЕЛЬНОСТЬ")
+print("="*70)
+print(results_df[['Avg_time_ms', 'Failed', 'N_evaluated']].to_string())
+
+# ============================================================
+# 8. ВИЗУАЛИЗАЦИЯ
+# ============================================================
+fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+
+# График 1: метрики точности
+ax = axes[0, 0]
+results_df[accuracy_cols].plot(kind='bar', ax=ax)
+ax.set_title('Точность по моделям', fontsize=12, fontweight='bold')
+ax.set_xticklabels(results_df.index, rotation=20)
+ax.legend(loc='upper left', fontsize=8)
+ax.grid(axis='y', alpha=0.3)
+
+# График 2: качество
+ax = axes[0, 1]
+norm_df = results_df[quality_cols].copy()
+for col in norm_df.columns:
+    if norm_df[col].max() > 0:
+        norm_df[col] = norm_df[col] / norm_df[col].max()
+norm_df.plot(kind='bar', ax=ax)
+ax.set_title('Качество РС (нормализовано)', fontsize=12, fontweight='bold')
+ax.set_xticklabels(results_df.index, rotation=20)
+ax.legend(loc='upper left', fontsize=8)
+ax.grid(axis='y', alpha=0.3)
+
+# График 3: сегменты юзеров
+ax = axes[1, 0]
+results_df[segment_cols].plot(kind='bar', ax=ax)
+ax.set_title('NDCG@10 по сегментам юзеров', fontsize=12, fontweight='bold')
+ax.set_xticklabels(results_df.index, rotation=20)
+ax.legend(['Cold (<5)', 'Warm (5-20)', 'Heavy (20+)'], fontsize=8)
+ax.grid(axis='y', alpha=0.3)
+
+# График 4: скорость
+ax = axes[1, 1]
+results_df['Avg_time_ms'].plot(kind='bar', ax=ax, color='coral')
+ax.set_title('Время выполнения, мс/запрос', fontsize=12, fontweight='bold')
+ax.set_xticklabels(results_df.index, rotation=20)
+ax.grid(axis='y', alpha=0.3)
+
+plt.suptitle('OFFLINE EVALUATION: Сравнение РС', fontsize=14, fontweight='bold')
+plt.tight_layout()
+plt.show()
+
+# ============================================================
+# 9. ИТОГИ И ПОБЕДИТЕЛЬ
+# ============================================================
+print("\n" + "="*70)
+print("ИТОГИ")
+print("="*70)
+
+best_by_metric = {}
+for col in ['NDCG@10', 'MAP@10', 'HitRate@10', 'Coverage', 'Diversity', 'Novelty']:
+    if col in results_df.columns:
+        best = results_df[col].idxmax()
+        best_by_metric[col] = (best, results_df.loc[best, col])
+
+print("\nЛидеры по каждой метрике:")
+for metric, (model, val) in best_by_metric.items():
+    print(f"  {metric:15s} → {model:20s} ({val})")
+
+# Финальный рейтинг по NDCG@10
+print("\nИТОГОВЫЙ РЕЙТИНГ ПО NDCG@10:")
+ranking = results_df.sort_values('NDCG@10', ascending=False)
+for i, (model, row) in enumerate(ranking.iterrows(), 1):
+    medal = "🥇" if i==1 else "🥈" if i==2 else "🥉" if i==3 else "  "
+    print(f"  {medal} {i}. {model:25s} NDCG@10 = {row['NDCG@10']}")
+
+# ============================================================
+# 10. ЭКСПОРТ РЕЗУЛЬТАТОВ (для обмена с компаньоном)
+# ============================================================
+results_df.to_csv('rs_evaluation_results.csv')
+results_df.to_json('rs_evaluation_results.json', orient='index', indent=2)
+print("\n✓ Результаты сохранены: rs_evaluation_results.csv / .json")
+
+# ============================================================
+# 11. ИНСТРУКЦИЯ ДЛЯ КОМПАНЬОНА
+# ============================================================
+print("\n" + "="*70)
+print("ИНСТРУКЦИЯ ДЛЯ ОБМЕНА С КОМПАНЬОНОМ")
+print("="*70)
+print("""
+Чтобы протестировать РС компаньона:
+
+1. Получите от него функцию следующего вида:
+
+    def recommend_companion(user_id, top_n=10) -> list[str]:
+        # ISBN в порядке убывания релевантности
+        return [...]
+
+2. Добавьте её в my_models:
+
+    my_models['Companion RS'] = recommend_companion
+
+3. Перезапустите ячейку. Все метрики будут посчитаны автоматически.
+
+4. Сравните результаты в итоговой таблице.
+
+ВАЖНО: РС компаньона должна использовать те же:
+  - train (для обучения, доступны все колонки)
+  - books (метаданные)
+  - НЕ должна заглядывать в test (это утечка!)
+""")
